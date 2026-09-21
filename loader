@@ -1,0 +1,738 @@
+-- Open source and vibecoded
+
+local PlayerLockOn = {}
+PlayerLockOn.__index = PlayerLockOn
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+local YAW_SCALE = -0.001747
+local PITCH_SCALE = -0.001345
+-- Lower gain and per-frame limits keep the camera movement gradual instead of snappy.
+local AIM_GAIN = 0.52
+local FAST_AIM_GAIN = 2.20
+local FAST_AIM_ANGLE = 0.12
+local YAW_LIMIT = 1800
+local PITCH_LIMIT = 1200
+local ANGLE_DEADZONE = 0.008
+local TARGET_REFRESH_INTERVAL = 0.20
+local DEFAULT_KEYBIND = nil
+
+local function normalizeKeybind(value)
+    if type(value) == "number" then return value end
+    local name = string.lower(tostring(value or ""))
+    if name == "" or name == "none" then return nil end
+    if #name == 1 then return string.byte(name) end
+
+    local special = {
+        space = 32, comma = 44, period = 46, slash = 47,
+        semicolon = 59, minus = 45, equals = 61,
+        leftalt = 18, rightalt = 18, leftshift = 16, rightshift = 16,
+        leftcontrol = 17, rightcontrol = 17, tab = 9, enter = 13,
+        backspace = 8, escape = 27, insert = 45, delete = 46,
+    }
+    return special[name]
+end
+
+local function getMouse2Press()
+    return (_G and _G.mouse2press) or mouse2press
+end
+
+local function getMouse2Release()
+    return (_G and _G.mouse2release) or mouse2release
+end
+
+local function getMouseMoveRelative()
+    return (_G and _G.mousemoverel) or mousemoverel
+end
+
+local function readCharacterPart(player, name)
+    if not player then return nil end
+    local ok, character = pcall(function() return player.Character end)
+    if not ok or not character then return nil end
+    local partOk, part = pcall(function() return character:FindFirstChild(name) end)
+    return partOk and part or nil
+end
+
+local function getHumanoid(player)
+    if not player then return nil end
+    local ok, character = pcall(function() return player.Character end)
+    if not ok or not character then return nil end
+    local humanoidOk, humanoid = pcall(function()
+        return character:FindFirstChildOfClass("Humanoid")
+    end)
+    return humanoidOk and humanoid or nil
+end
+
+local function getTeam(player)
+    if not player then return nil end
+    local ok, team = pcall(function() return player.Team end)
+    return ok and team or nil
+end
+
+local function getPosition(part)
+    if not part then return nil end
+    local ok, position = pcall(function() return part.Position end)
+    return ok and position or nil
+end
+
+function PlayerLockOn:_setupUI()
+    local ui
+    local env = (_G and _G.RimuruUI) and _G or nil
+
+    if type(getgenv) == "function" then
+        pcall(function()
+            local shared = getgenv()
+            env = shared
+            ui = shared.RimuruUI
+        end)
+    end
+    if not ui and _G then ui = _G.RimuruUI end
+
+    if not ui and isfile and isfile("RimuruUI.lua") then
+        local loadedOk, loaded = pcall(function()
+            local chunk = assert(loadstring(readfile("RimuruUI.lua")))
+            return chunk()
+        end)
+        if loadedOk and type(loaded) == "table" then
+            ui = loaded
+        end
+        if not ui and env and type(env.RimuruUI) == "table" then
+            ui = env.RimuruUI
+        end
+        if not ui and _G and type(_G.RimuruUI) == "table" then
+            ui = _G.RimuruUI
+        end
+    end
+
+    if not ui and env and type(env.RimuruUI) == "table" then
+        ui = env.RimuruUI
+    end
+    if not ui and _G and type(_G.RimuruUI) == "table" then
+        ui = _G.RimuruUI
+    end
+
+    if not ui or type(ui.CreateWindow) ~= "function" then return end
+
+    local ok, window = pcall(function()
+        return ui.CreateWindow({
+            Title = "Aba Lock-On",
+            Subtitle = "Targeting",
+            Size = { 600, 450 },
+            ToggleKey = "comma",
+            ConfigName = "AbaLockOn",
+            ConfigFolder = "AbaLockOn",
+            Theme = "Rimuru Hub",
+            Loading = true,
+            Watermark = true,
+            KeybindOverlay = true,
+        })
+    end)
+    if not ok or type(window) ~= "table" then return end
+
+    if type(ui.Start) == "function" then
+        pcall(ui.Start)
+    end
+
+    self.UIWindow = window
+    local category = window:CreateCategory("COMBAT")
+    local tab = category:CreateTab("Lock-On", "crosshair")
+    local section = tab:CreateSection("TARGETING", { Column = "Left" })
+
+    self.UIToggle = section:AddToggle("Enable Lock-On", {
+        Default = self.MasterEnabled,
+        Keybind = {
+            Default = "None",
+            Mode = "toggle",
+        },
+        Callback = function(value)
+            self:SetMasterEnabled(value == true)
+        end,
+    })
+    self.UIToggle.KeybindCallback = function(active)
+        if self.MasterEnabled then
+            self:SetEnabled(active == true)
+        end
+    end
+    if self.UIToggle.Keybind and self.UIToggle.Keybind.Value then
+        self:SetKeybind(self.UIToggle.Keybind.Value)
+    end
+    self.UIRange = section:AddSlider("Lock-On Range", {
+        Min = 25,
+        Max = 500,
+        Default = self.LockOnRange,
+        Increment = 5,
+        Callback = function(value)
+            self.LockOnRange = math.max(25, tonumber(value) or 90)
+        end,
+    })
+    self.UIBoxToggle = section:AddToggle("Target Box", {
+        Default = self.TargetBoxEnabled,
+        Callback = function(value)
+            self.TargetBoxEnabled = value == true
+            self:_updateTargetBox()
+        end,
+    })
+    section:AddLabel("Bind a key to toggle. AFK and lobby players are ignored.")
+end
+
+function PlayerLockOn.new(options)
+    local self = setmetatable({}, PlayerLockOn)
+    options = options or {}
+    self.Enabled = false
+     self.MasterEnabled = false
+   self.Destroyed = false
+    self.Target = nil
+    self.LockOnRange = tonumber(options.LockOnRange) or 90
+    self.TargetBoxEnabled = options.TargetBoxEnabled ~= false
+    self.LastTargetScan = 0
+    self.TargetRefreshInterval = tonumber(options.TargetRefreshInterval) or TARGET_REFRESH_INTERVAL
+    self.Keybind = options.Keybind or DEFAULT_KEYBIND
+
+    self.KeybindName = "none"
+    self.KeyWasDown = false 
+    self.LastToggleTime = 0 
+    self.EventKeyDown = false  self.RightMouseDown = false
+    self.HeartbeatConnection = nil
+    self.InputConnection = nil
+
+    self.InputEndedConnection = nil    self.Indicator = nil
+    self.TargetBox = nil
+
+
+    self:_setupUI()
+    if not self.UIWindow then
+        task.spawn(function()
+            task.wait(0.25)
+            if not self.Destroyed and not self.UIWindow then
+                self:_setupUI()
+            end
+        end)
+    end
+
+    pcall(function()
+        local indicator = Drawing.new("Text")
+        indicator.Text = "Lock-On: OFF"
+        indicator.Position = Vector2.new(20, 20)
+        indicator.Size = 16
+        indicator.Font = 2
+        indicator.Outline = true
+        indicator.Color = Color3.fromRGB(255, 80, 80)
+        indicator.Visible = true
+        self.Indicator = indicator
+    end)
+    pcall(function()
+        local box = Drawing.new("Square")
+        box.Thickness = 1
+        box.Filled = false
+        box.Color = Color3.fromRGB(255, 220, 80)
+        box.Transparency = 0
+        box.Visible = false
+        self.TargetBox = box
+    end)
+
+    self.InputConnection = nil
+    self.InputEndedConnection = nil
+
+    pcall(function()
+        self.InputConnection = UserInputService.InputBegan:Connect(function(input)
+            if self.Destroyed or not input then return end
+            local sharedUI = _G and _G.RimuruUI
+            if sharedUI and type(sharedUI.WasPressed) == "function" then return end
+
+            local key = input.KeyCode or input
+            if key == self.Keybind and not self.EventKeyDown then
+                self.EventKeyDown = true
+                if self.MasterEnabled then
+                    self:SetEnabled(not self.Enabled)
+                end
+            end
+        end)
+    end)
+
+    pcall(function()
+        self.InputEndedConnection = UserInputService.InputEnded:Connect(function(input)
+            local key = input and (input.KeyCode or input)
+            if key == self.Keybind then
+                self.EventKeyDown = false
+            end
+        end)
+    end)
+
+    self.HeartbeatConnection = RunService.RenderStepped:Connect(function()
+        self:_step()
+    end)
+
+    return self
+end
+
+function PlayerLockOn:_updateIndicator()
+    if not self.Indicator then return end
+    pcall(function()
+        self.Indicator.Text = self.Enabled and "Lock-On: ON" or "Lock-On: OFF"
+        self.Indicator.Color = self.Enabled
+            and Color3.fromRGB(80, 255, 120)
+            or Color3.fromRGB(255, 80, 80)
+        self.Indicator.Visible = not self.Destroyed
+    end)
+end
+
+function PlayerLockOn:_releaseAim()
+    if self.RightMouseDown then
+        local release = getMouse2Release()
+        if release then pcall(function() release() end) end
+    end
+    self.RightMouseDown = false
+end
+
+function PlayerLockOn:_updateTargetBox()
+    if not self.TargetBox then return end
+    local visible = false
+    pcall(function()
+        if self.TargetBoxEnabled and self.Enabled and self.MasterEnabled and self:_isAllowedState() and self:_isValidTarget(self.Target) and self:_isInRange(self.Target) then
+            local root = self:_getTargetRoot(self.Target)
+            local rootPosition = getPosition(root)
+            if rootPosition then
+                local head
+                local characterOk, character = pcall(function() return self.Target.Character end)
+                if characterOk and character then
+                    head = readCharacterPart(self.Target, "Head")
+                else
+                    head = readModelPart(self.Target, "Head")
+                end
+                local headPosition = getPosition(head) or (rootPosition + Vector3.new(0, 3, 0))
+                local bottomPosition = rootPosition - Vector3.new(0, 3, 0)
+                local top, topVisible = WorldToScreen(headPosition)
+                local bottom, bottomVisible = WorldToScreen(bottomPosition)
+                if topVisible and bottomVisible then
+                    local height = math.max(12, bottom.Y - top.Y)
+                    local width = math.max(8, height * 0.48)
+                    self.TargetBox.Position = Vector2.new(top.X - width / 2, top.Y)
+                    self.TargetBox.Size = Vector2.new(width, height)
+                    visible = true
+                end
+            end
+        end
+    end)
+    self.TargetBox.Visible = visible
+end
+
+function PlayerLockOn:_isAllowedState()
+    local localTeam = getTeam(LocalPlayer)
+    local teamName = string.lower(tostring(localTeam and localTeam.Name or ""))
+    if teamName == ".afk" or teamName == "afk" or string.find(teamName, "lobby", 1, true) then
+        return false
+    end
+    local characterOk, character = pcall(function() return LocalPlayer and LocalPlayer.Character end)
+    if not characterOk or not character then return false end
+    local parentOk, parent = pcall(function() return character.Parent end)
+    local parentName = string.lower(tostring(parent and parent.Name or ""))
+    if string.find(parentName, "lobby", 1, true) or string.find(parentName, "afk", 1, true) then
+        return false
+    end
+    local lobbyOk, lobby = pcall(function() return Workspace:FindFirstChild("Lobby") end)
+    if lobbyOk and lobby then
+        local insideOk, insideLobby = pcall(function() return character:IsDescendantOf(lobby) end)
+        if insideOk and insideLobby then return false end
+    end
+    local humanoid = getHumanoid(LocalPlayer)
+    local root = readCharacterPart(LocalPlayer, "HumanoidRootPart")
+    if not humanoid or not root then return false end
+    local healthOk, health = pcall(function() return humanoid.Health end)
+    return healthOk and tonumber(health) and health > 0
+end
+
+local function readModelPart(model, name)
+    if not model then return nil end
+    local ok, part = pcall(function() return model:FindFirstChild(name) end)
+    return ok and part or nil
+end
+
+local function getModelHumanoid(model)
+    if not model then return nil end
+    local ok, humanoid = pcall(function()
+        return model:FindFirstChildOfClass("Humanoid")
+    end)
+    return ok and humanoid or nil
+end
+
+function PlayerLockOn:_isAttackableModel(model)
+    if not model then return false end
+    local nameOk, name = pcall(function() return model.Name end)
+    if nameOk and LocalPlayer and name == LocalPlayer.Name then return false end
+    local humanoid = getModelHumanoid(model)
+    local root = readModelPart(model, "HumanoidRootPart")
+    if not humanoid or not root then return false end
+    local healthOk, health = pcall(function() return humanoid.Health end)
+    return healthOk and tonumber(health) and health > 0
+end
+
+function PlayerLockOn:_getTargetRoot(target)
+    if not target then return nil end
+    local characterOk, character = pcall(function() return target.Character end)
+    if characterOk and character then
+        return readCharacterPart(target, "HumanoidRootPart")
+    end
+    return readModelPart(target, "HumanoidRootPart")
+end
+
+function PlayerLockOn:_isInRange(target)
+    if not target then return false end
+    local localRoot = readCharacterPart(LocalPlayer, "HumanoidRootPart")
+    local targetRoot = self:_getTargetRoot(target)
+    local localPosition = getPosition(localRoot)
+    local targetPosition = getPosition(targetRoot)
+    if not localPosition or not targetPosition then return false end
+    return (targetPosition - localPosition).Magnitude <= (tonumber(self.LockOnRange) or 90)
+end
+
+function PlayerLockOn:_isOpposingTeam(player)
+    if not LocalPlayer or not player or player == LocalPlayer then return false end
+    local localTeam = getTeam(LocalPlayer)
+    local targetTeam = getTeam(player)
+    local localName = string.lower(tostring(localTeam and localTeam.Name or ""))
+    local targetName = string.lower(tostring(targetTeam and targetTeam.Name or ""))
+    if targetName == ".afk" or targetName == "afk" or string.find(targetName, "lobby", 1, true) then
+        return false
+    end
+    local localNeutral = localTeam == nil or localName == "neutral" or string.find(localName, "neutral", 1, true)
+    local targetNeutral = targetTeam == nil or targetName == "neutral" or string.find(targetName, "neutral", 1, true)
+    if localNeutral then return true end
+    return targetNeutral or localTeam ~= targetTeam
+end
+
+function PlayerLockOn:_isValidTarget(target)
+    if not target then return false end
+    local characterOk, character = pcall(function() return target.Character end)
+    if characterOk and character then
+        if not self:_isOpposingTeam(target) then return false end
+        local humanoid = getHumanoid(target)
+        local root = readCharacterPart(target, "HumanoidRootPart")
+        if not humanoid or not root then return false end
+        local healthOk, health = pcall(function() return humanoid.Health end)
+        return healthOk and tonumber(health) and health > 0
+    end
+    return self:_isAttackableModel(target)
+end
+
+function PlayerLockOn:_isTargetDead(target)
+    if not target then return false end
+    local humanoid = nil
+    local characterOk, character = pcall(function() return target.Character end)
+    if characterOk and character then
+        humanoid = getHumanoid(target)
+    else
+        humanoid = getModelHumanoid(target)
+    end
+    if not humanoid then return false end
+    local healthOk, health = pcall(function() return humanoid.Health end)
+    return healthOk and tonumber(health) ~= nil and tonumber(health) <= 0
+end
+
+function PlayerLockOn:_findNearestTarget()
+    local localRoot = readCharacterPart(LocalPlayer, "HumanoidRootPart")
+    local localPosition = getPosition(localRoot)
+    if not localPosition then return nil end
+    local cameraLook = nil
+    local cameraOk, camera = pcall(function() return Workspace.CurrentCamera end)
+    if cameraOk and camera then
+        local lookOk, lookVector = pcall(function()
+            return camera.CFrame.LookVector
+        end)
+        if lookOk then cameraLook = lookVector end
+    end
+    local nearest, nearestScore, nearestDistance = nil, -math.huge, math.huge
+    local function consider(target)
+        if not self:_isValidTarget(target) then return end
+        if not self:_isInRange(target) then return end
+        local position = getPosition(self:_getTargetRoot(target))
+        if not position then return end
+        local offset = position - localPosition
+        local distance = offset.Magnitude
+        if distance < 0.01 then return end
+        local score = cameraLook and cameraLook:Dot(offset.Unit) or -distance
+        if score > nearestScore or (score == nearestScore and distance < nearestDistance) then
+            nearest, nearestScore, nearestDistance = target, score, distance
+        end
+    end
+    local ok, players = pcall(function() return Players:GetPlayers() end)
+    if ok and type(players) == "table" then
+        for _, player in ipairs(players) do consider(player) end
+    end
+    local liveOk, liveFolder = pcall(function() return Workspace:FindFirstChild("Live") end)
+    if liveOk and liveFolder then
+        local childrenOk, children = pcall(function() return liveFolder:GetChildren() end)
+        if childrenOk and type(children) == "table" then
+            for _, model in ipairs(children) do consider(model) end
+        end
+    end
+    return nearest
+end
+
+function PlayerLockOn:_refreshTarget(now)
+    if self.Target and self:_isValidTarget(self.Target) and self:_isInRange(self.Target) then return self.Target end
+    self.Target = nil
+    if now - self.LastTargetScan >= self.TargetRefreshInterval then
+        self.LastTargetScan = now
+        self.Target = self:_findNearestTarget()
+    end
+    return self.Target
+end
+
+function PlayerLockOn:_aimAt(position)
+    local cameraOk, camera = pcall(function() return Workspace.CurrentCamera end)
+    if not cameraOk or not camera or not position then
+        self:_releaseAim()
+        return
+    end
+    local cframeOk, cameraCFrame = pcall(function() return camera.CFrame end)
+    if not cframeOk or not cameraCFrame then
+        self:_releaseAim()
+        return
+    end
+    local cameraPosition = cameraCFrame.Position
+    local cameraLook = cameraCFrame.LookVector
+    local dx, dy, dz = position.X - cameraPosition.X, position.Y - cameraPosition.Y, position.Z - cameraPosition.Z
+    local horizontal = math.sqrt(dx * dx + dz * dz)
+    if horizontal < 0.01 then return end
+    local yawDelta = math.atan2(-dx, -dz) - math.atan2(-cameraLook.X, -cameraLook.Z)
+    while yawDelta > math.pi do yawDelta = yawDelta - (2 * math.pi) end
+    while yawDelta < -math.pi do yawDelta = yawDelta + (2 * math.pi) end
+    local pitchDelta = math.atan2(dy, horizontal) - math.asin(cameraLook.Y)
+    if math.abs(yawDelta) < ANGLE_DEADZONE and math.abs(pitchDelta) < ANGLE_DEADZONE then return end
+    local press = getMouse2Press()
+    if not self.RightMouseDown and press then
+        pcall(function()
+            if setrobloxinput then setrobloxinput(true) end
+            press()
+        end)
+        self.RightMouseDown = true
+    end
+    local gain = AIM_GAIN
+    if math.max(math.abs(yawDelta), math.abs(pitchDelta)) >= FAST_AIM_ANGLE then
+        gain = FAST_AIM_GAIN
+    end
+    local yaw = (yawDelta / YAW_SCALE) * gain
+    local pitch = (pitchDelta / PITCH_SCALE) * gain
+    if yaw > YAW_LIMIT then yaw = YAW_LIMIT elseif yaw < -YAW_LIMIT then yaw = -YAW_LIMIT end
+    if pitch > PITCH_LIMIT then pitch = PITCH_LIMIT elseif pitch < -PITCH_LIMIT then pitch = -PITCH_LIMIT end
+    local moveRelative = getMouseMoveRelative()
+    if moveRelative then pcall(function() moveRelative(yaw, pitch) end) end
+end
+
+function PlayerLockOn:_step()
+    local sharedUI = _G and _G.RimuruUI
+    local usingRimuruInput = sharedUI and type(sharedUI.WasPressed) == "function"
+
+    if not usingRimuruInput then
+        local keyDown = false
+        local candidates = {self.Keybind}
+        for _, candidate in ipairs(candidates) do
+            if candidate and UserInputService and UserInputService.IsKeyDown then
+                pcall(function()
+                    if UserInputService:IsKeyDown(candidate) then
+                        keyDown = true
+                    end
+                end)
+            end
+            if not keyDown and candidate and iskeypressed then
+                pcall(function()
+                    if iskeypressed(candidate) == true then
+                        keyDown = true
+                    end
+                end)
+            end
+            if keyDown then break end
+        end
+        if keyDown and not self.KeyWasDown then
+            local now = tick()
+            if now - (self.LastToggleTime or 0) >= 0.20 then
+                self.LastToggleTime = now
+                if self.MasterEnabled then
+                    self:SetEnabled(not self.Enabled)
+                end
+            end
+        end
+        self.KeyWasDown = keyDown
+    end
+
+    self:_updateIndicator()
+    self:_updateTargetBox()
+    if not self.MasterEnabled then
+        self:SetEnabled(false)
+        return
+    end
+    if self.Destroyed or not self.Enabled then
+        self:_releaseAim()
+        return
+    end
+    if not self:_isAllowedState() then
+        self.Target = nil
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+
+    if self.Target and not self:_isValidTarget(self.Target) then
+        self.Target = nil
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+
+    if self.Target and self:_isTargetDead(self.Target) then
+        self.Target = nil
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+
+    if self.Target and not self:_isInRange(self.Target) then
+        self.Target = nil
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+
+    if isrbxactive then
+        local activeOk, active = pcall(isrbxactive)
+        if activeOk and not active then
+            self:_releaseAim()
+            return
+        end
+    end
+
+    local now = tick()
+    local target = self:_refreshTarget(now)
+    if not target then
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+
+    local root = self:_getTargetRoot(target)
+    local position = getPosition(root)
+    if not position then
+        self.Target = nil
+        self:SetEnabled(false)
+        self:_releaseAim()
+        self:_updateTargetBox()
+        return
+    end
+    self:_aimAt(position)
+    self:_updateTargetBox()
+end
+
+function PlayerLockOn:SetMasterEnabled(enabled)
+    if self.Destroyed then return self end
+    self.MasterEnabled = enabled == true
+    if not self.MasterEnabled then
+        self:SetEnabled(false)
+    end
+    if self.UIToggle and self.UIToggle.SetValue then
+        pcall(function()
+            self.UIToggle:SetValue(self.MasterEnabled, true)
+        end)
+    end
+    self:_updateIndicator()
+    self:_updateTargetBox()
+    return self
+end
+
+function PlayerLockOn:SetEnabled(enabled)
+    if self.Destroyed then return self end
+    self.Enabled = enabled == true
+    if not self.Enabled then
+        self.Target = nil
+        self:_releaseAim()
+    end
+    self:_updateIndicator()
+    return self
+end
+
+function PlayerLockOn:SetKeybind(keybind)
+    self.KeybindName = string.lower(tostring(keybind or ""))
+    self.Keybind = normalizeKeybind(keybind)
+    self.EventKeyDown = false
+    self.KeyWasDown = false
+    return self
+end
+
+function PlayerLockOn:Toggle()
+    if not self.MasterEnabled then return self end
+    return self:SetEnabled(not self.Enabled)
+end
+
+function PlayerLockOn:IsEnabled()
+    return self.Enabled == true and not self.Destroyed
+end
+
+function PlayerLockOn:GetTarget()
+    if self.Destroyed or not self:_isValidTarget(self.Target) then
+        return nil
+    end
+    return self.Target
+end
+
+function PlayerLockOn:ClearTarget()
+    self.Target = nil
+    self:_releaseAim()
+    return self
+end
+
+function PlayerLockOn:Destroy()
+    if self.Destroyed then return end
+    self.Destroyed = true
+    self.Enabled = false
+    self.Target = nil
+    self:_releaseAim()
+    if self.HeartbeatConnection then
+        pcall(function() self.HeartbeatConnection:Disconnect() end)
+        self.HeartbeatConnection = nil
+    end
+    if self.InputConnection then
+        pcall(function() self.InputConnection:Disconnect() end)
+        self.InputConnection = nil
+    end
+     if self.InputEndedConnection then
+        pcall(function() self.InputEndedConnection:Disconnect() end)
+        self.InputEndedConnection = nil
+    end
+   if self.Indicator then
+        pcall(function() self.Indicator:Remove() end)
+        self.Indicator = nil
+    end
+    if self.TargetBox then
+        pcall(function() self.TargetBox:Remove() end)
+        self.TargetBox = nil
+    end
+end
+
+if _G and _G.AbaLockonInstance then
+    local previous = _G.AbaLockonInstance
+    pcall(function() previous:Destroy() end)
+    pcall(function()
+        if previous.HeartbeatConnection then previous.HeartbeatConnection:Disconnect() end
+    end)
+    pcall(function()
+        if previous.InputConnection then previous.InputConnection:Disconnect() end
+        if previous.InputEndedConnection then previous.InputEndedConnection:Disconnect() end
+    end)
+    pcall(function()
+        if previous.Indicator then previous.Indicator:Remove() end
+        if previous.TargetBox then previous.TargetBox:Remove() end
+    end)
+end
+local active = PlayerLockOn.new()
+if _G then _G.AbaLockonInstance = active end
+
+return active
+print("I'm not a bad slime!\n 0klayt")
