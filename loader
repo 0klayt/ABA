@@ -1,3 +1,4 @@
+-- Open source and vibecoded
 
 local PlayerLockOn = {}
 PlayerLockOn.__index = PlayerLockOn
@@ -10,7 +11,6 @@ local LocalPlayer = Players.LocalPlayer
 
 local YAW_SCALE = -0.001747
 local PITCH_SCALE = -0.001345
--- Lower gain and per-frame limits keep the camera movement gradual instead of snappy.
 local AIM_GAIN = 0.52
 local FAST_AIM_GAIN = 2.20
 local FAST_AIM_ANGLE = 0.12
